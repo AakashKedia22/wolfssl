@@ -169,16 +169,6 @@ static uint8_t AesKeyLenToDthe(word32 keylen)
     }
 }
 
-static uint8_t AesCcmMToDthe(word32 authTagSz)
-{
-    return (uint8_t)((authTagSz - 2) / 2);
-}
-
-static uint8_t AesCcmLToDthe(word32 nonceSz)
-{
-    return (uint8_t)(14 - nonceSz);
-}
-
 static int AesSetIV(Aes* aes, const byte* iv)
 {
     if (aes == NULL)
@@ -345,50 +335,58 @@ int wc_AesEcbDecrypt(Aes* aes, byte* out, const byte* in, word32 sz)
 #ifdef WOLFSSL_AES_COUNTER
 int wc_AesCtrEncrypt(Aes* aes, byte* out, const byte* in, word32 sz)
 {
-    char out_block[WC_AES_BLOCK_SIZE];
-    int odd, even;
-    char *tmp;
+    byte* keystream;
+    word32 processed;
+    word32 even;
     int ret;
 
     if ((aes == NULL) || (out == NULL) || (in == NULL))
         return BAD_FUNC_ARG;
 
-    tmp = (char *)aes->tmp;
-    if (aes->left) {
-        if ((aes->left + sz) >= WC_AES_BLOCK_SIZE)
-            odd = WC_AES_BLOCK_SIZE - aes->left;
-        else
-            odd = sz;
-        XMEMCPY(tmp + aes->left, in, odd);
-        if ((odd + aes->left) == WC_AES_BLOCK_SIZE) {
-            ret = AesOneShot(aes, (byte*)out_block, (byte const*)tmp,
-                             WC_AES_BLOCK_SIZE, DTHE_AES_ENCRYPT, DTHE_AES_CTR_MODE);
-            if (ret != 0) return ret;
-            XMEMCPY(out, out_block + aes->left, odd);
-            aes->left = 0;
-            XMEMSET(tmp, 0, WC_AES_BLOCK_SIZE);
-        }
-        in  += odd;
-        out += odd;
-        sz  -= odd;
+    /* aes->tmp caches the raw keystream block for the current counter
+     * value; aes->left counts how many of its trailing bytes are still
+     * unused. Consume those first, byte-for-byte, without touching the
+     * hardware or the counter - this block's keystream was already
+     * generated (and the counter already advanced past it) by whichever
+     * earlier call produced it. Re-deriving it via another AesOneShot()
+     * call here would use the now-advanced counter and produce the wrong
+     * keystream for this block. */
+    keystream = (byte*)aes->tmp + WC_AES_BLOCK_SIZE - aes->left;
+    processed = (aes->left < sz) ? aes->left : sz;
+    while (processed > 0) {
+        *(out++) = *(in++) ^ *(keystream++);
+        aes->left--;
+        sz--;
+        processed--;
     }
-    odd = sz % WC_AES_BLOCK_SIZE;
-    if (sz / WC_AES_BLOCK_SIZE) {
-        even = (sz / WC_AES_BLOCK_SIZE) * WC_AES_BLOCK_SIZE;
+
+    even = sz - (sz % WC_AES_BLOCK_SIZE);
+    if (even > 0) {
         ret = AesOneShot(aes, out, in, even, DTHE_AES_ENCRYPT, DTHE_AES_CTR_MODE);
         if (ret != 0) return ret;
         out += even;
         in  += even;
+        sz  -= even;
     }
-    if (odd) {
-        XMEMSET(tmp + aes->left, 0, WC_AES_BLOCK_SIZE - aes->left);
-        XMEMCPY(tmp + aes->left, in, odd);
-        ret = AesOneShot(aes, (byte*)out_block, (byte const*)tmp,
-                         WC_AES_BLOCK_SIZE, DTHE_AES_ENCRYPT, DTHE_AES_CTR_MODE);
+
+    if (sz > 0) {
+        byte zero[WC_AES_BLOCK_SIZE];
+        XMEMSET(zero, 0, sizeof(zero));
+        /* CTR-encrypt a zero block to pull out the raw keystream for the
+         * current counter value; this also advances the counter by the
+         * one block consumed here. */
+        ret = AesOneShot(aes, (byte*)aes->tmp, zero, WC_AES_BLOCK_SIZE,
+                         DTHE_AES_ENCRYPT, DTHE_AES_CTR_MODE);
         if (ret != 0) return ret;
-        XMEMCPY(out, out_block + aes->left, odd);
-        aes->left += odd;
+        aes->left = WC_AES_BLOCK_SIZE;
+        keystream = (byte*)aes->tmp;
+        while (sz > 0) {
+            *(out++) = *(in++) ^ *(keystream++);
+            aes->left--;
+            sz--;
+        }
     }
+
     return 0;
 }
 
@@ -562,468 +560,43 @@ int wc_AesXtsFree(XtsAes* aes)
 #endif /* WOLFSSL_AES_XTS */
 
 /* ======================================================================== */
-/* GCM / CCM shared helpers                                                 */
-/* ======================================================================== */
-
-#if defined(HAVE_AESGCM) || defined(HAVE_AESCCM)
-
-#ifndef NO_RNG
-static WC_INLINE void IncCtr(byte* ctr, word32 ctrSz)
-{
-    int i;
-    for (i = (int)ctrSz - 1; i >= 0; i--)
-        if (++ctr[i]) break;
-}
-#endif
-
-static int AesAuthArgCheck(Aes* aes, byte* out, const byte* in, word32 inSz,
-                            const byte* nonce, word32 nonceSz,
-                            const byte* authTag, word32 authTagSz, int mode)
-{
-    if (aes == NULL || nonce == NULL || authTag == NULL)
-        return BAD_FUNC_ARG;
-    if (inSz != 0 && (out == NULL || in == NULL))
-        return BAD_FUNC_ARG;
-    switch (authTagSz) {
-        case 4: case 6: case 8: case 10: case 12: case 14: case 16:
-            break;
-        default:
-            return BAD_FUNC_ARG;
-    }
-    switch (nonceSz) {
-        case 7: case 8: case 9: case 10: case 11: case 12: case 13: case 14:
-            break;
-        default:
-            return BAD_FUNC_ARG;
-    }
-    if (mode == DTHE_AES_CCM_MODE) {
-        word32 lenSz = (word32)WC_AES_BLOCK_SIZE - 1U - nonceSz;
-        if ((lenSz < sizeof(inSz)) && (inSz >= ((word32)1 << (lenSz * 8))))
-            return AES_CCM_OVERFLOW_E;
-    }
-    return 0;
-}
-
-static int AesAuthSetKey(Aes* aes, const byte* key, word32 keySz)
-{
-    byte nonce[WC_AES_BLOCK_SIZE];
-    if ((aes == NULL) || (key == NULL))
-        return BAD_FUNC_ARG;
-    if (!((keySz == 16) || (keySz == 24) || (keySz == 32)))
-        return BAD_FUNC_ARG;
-    XMEMSET(nonce, 0, sizeof(nonce));
-    return wc_AesSetKey(aes, key, keySz, nonce, AES_ENCRYPTION);
-}
-
-static int AesAuthEncrypt(Aes* aes, byte* out, const byte* in, word32 inSz,
-                           const byte* nonce, word32 nonceSz,
-                           byte* authTag, word32 authTagSz,
-                           const byte* authIn, word32 authInSz, int mode)
-{
-    int ret;
-    DTHE_AES_Params params;
-    DTHE_Handle h = (DTHE_Handle)wolfSSL_TI_getDtheHandle();
-    word32 tmpTag[WC_AES_BLOCK_SIZE / sizeof(word32)];
-    uint32_t algoType = (mode == DTHE_AES_CCM_MODE) ? DTHE_AES_CCM_MODE
-                                                     : DTHE_AES_GCM_MODE;
-
-    if (h == NULL) return WC_HW_E;
-    ret = AesAuthArgCheck(aes, out, in, inSz, nonce, nonceSz, authTag,
-                          authTagSz, algoType);
-    if (ret != 0) return ret;
-    if ((authIn == NULL) && (authInSz > 0)) return BAD_FUNC_ARG;
-
-    if (inSz == 0 && authInSz == 0) {
-        DTHE_AES_Params ecb;
-        XMEMSET(&ecb, 0, sizeof(ecb));
-        ecb.algoType = DTHE_AES_ECB_MODE;
-        ecb.opType   = DTHE_AES_ENCRYPT;
-        ecb.ptrKey   = (uint32_t*)aes->key;
-        ecb.keyLen   = AesKeyLenToDthe(aes->keylen);
-        ecb.ptrPlainTextData = (uint32_t*)(uintptr_t)SOC_virtToPhy((void*)aes->reg);
-        ecb.ptrEncryptedData = (uint32_t*)(uintptr_t)SOC_virtToPhy((void*)tmpTag);
-        ecb.dataLenBytes = WC_AES_BLOCK_SIZE;
-        ecb.streamState  = DTHE_AES_ONE_SHOT_SUPPORT;
-        wolfSSL_TI_lockCCM();
-        ret = DTHE_AES_execute(h, &ecb);
-        wolfSSL_TI_unlockCCM();
-        if (ret != DTHE_AES_RETURN_SUCCESS) return WC_HW_E;
-        XMEMCPY(authTag, tmpTag, authTagSz);
-        return 0;
-    }
-
-    XMEMSET(&params, 0, sizeof(params));
-    params.algoType     = algoType;
-    params.opType       = DTHE_AES_ENCRYPT;
-    params.ptrKey       = (uint32_t*)aes->key;
-    params.keyLen       = AesKeyLenToDthe(aes->keylen);
-    params.ptrIV        = (uint32_t*)nonce;
-    params.ptrPlainTextData  = (uint32_t*)(uintptr_t)SOC_virtToPhy((void*)in);
-    params.ptrEncryptedData  = (uint32_t*)(uintptr_t)SOC_virtToPhy((void*)out);
-    params.dataLenBytes = inSz;
-    params.ptrTag       = (uint32_t*)tmpTag;
-    params.ptrAAD       = (uint32_t*)(uintptr_t)SOC_virtToPhy((void*)authIn);
-    params.aadLength    = authInSz;
-    params.counterWidth = DTHE_AES_CTR_WIDTH_32;
-    params.streamState  = DTHE_AES_ONE_SHOT_SUPPORT;
-    params.modeSelect   = DTHE_AES_NO_MODE;
-    if (algoType == DTHE_AES_CCM_MODE) {
-        params.ccmL = AesCcmLToDthe(nonceSz);
-        params.ccmM = AesCcmMToDthe(authTagSz);
-    }
-
-    wolfSSL_TI_lockCCM();
-    ret = DTHE_AES_execute(h, &params);
-    wolfSSL_TI_unlockCCM();
-
-    if (ret != DTHE_AES_RETURN_SUCCESS) {
-        XMEMSET(out, 0, inSz);
-        XMEMSET(authTag, 0, authTagSz);
-        return AES_GCM_AUTH_E;
-    }
-    XMEMCPY(authTag, tmpTag, authTagSz);
-    return 0;
-}
-
-static int AesAuthDecrypt(Aes* aes, byte* out, const byte* in, word32 inSz,
-                           const byte* nonce, word32 nonceSz,
-                           const byte* authTag, word32 authTagSz,
-                           const byte* authIn, word32 authInSz, int mode)
-{
-    int ret;
-    DTHE_AES_Params params;
-    DTHE_Handle h = (DTHE_Handle)wolfSSL_TI_getDtheHandle();
-    word32 tmpTag[WC_AES_BLOCK_SIZE / sizeof(word32)];
-    uint32_t algoType = (mode == DTHE_AES_CCM_MODE) ? DTHE_AES_CCM_MODE
-                                                     : DTHE_AES_GCM_MODE;
-
-    if (h == NULL) return WC_HW_E;
-    ret = AesAuthArgCheck(aes, out, in, inSz, nonce, nonceSz, authTag,
-                          authTagSz, algoType);
-    if (ret != 0) return ret;
-    if ((authIn == NULL) && (authInSz > 0)) return BAD_FUNC_ARG;
-
-    if (inSz == 0 && authInSz == 0) {
-        DTHE_AES_Params ecb;
-        XMEMSET(&ecb, 0, sizeof(ecb));
-        ecb.algoType = DTHE_AES_ECB_MODE;
-        ecb.opType   = DTHE_AES_ENCRYPT;
-        ecb.ptrKey   = (uint32_t*)aes->key;
-        ecb.keyLen   = AesKeyLenToDthe(aes->keylen);
-        ecb.ptrPlainTextData = (uint32_t*)(uintptr_t)SOC_virtToPhy((void*)aes->reg);
-        ecb.ptrEncryptedData = (uint32_t*)(uintptr_t)SOC_virtToPhy((void*)tmpTag);
-        ecb.dataLenBytes = WC_AES_BLOCK_SIZE;
-        ecb.streamState  = DTHE_AES_ONE_SHOT_SUPPORT;
-        wolfSSL_TI_lockCCM();
-        ret = DTHE_AES_execute(h, &ecb);
-        wolfSSL_TI_unlockCCM();
-        if (ret != DTHE_AES_RETURN_SUCCESS) return WC_HW_E;
-        return (ConstantCompare(authTag, tmpTag, authTagSz) == 0) ? 0
-                                                                  : AES_GCM_AUTH_E;
-    }
-
-    XMEMSET(&params, 0, sizeof(params));
-    params.algoType     = algoType;
-    params.opType       = DTHE_AES_DECRYPT;
-    params.ptrKey       = (uint32_t*)aes->key;
-    params.keyLen       = AesKeyLenToDthe(aes->keylen);
-    params.ptrIV        = (uint32_t*)nonce;
-    params.ptrPlainTextData  = (uint32_t*)(uintptr_t)SOC_virtToPhy((void*)out);
-    params.ptrEncryptedData  = (uint32_t*)(uintptr_t)SOC_virtToPhy((void*)in);
-    params.dataLenBytes = inSz;
-    params.ptrTag       = (uint32_t*)tmpTag;
-    params.ptrAAD       = (uint32_t*)(uintptr_t)SOC_virtToPhy((void*)authIn);
-    params.aadLength    = authInSz;
-    params.counterWidth = DTHE_AES_CTR_WIDTH_32;
-    params.streamState  = DTHE_AES_ONE_SHOT_SUPPORT;
-    params.modeSelect   = DTHE_AES_NO_MODE;
-    if (algoType == DTHE_AES_CCM_MODE) {
-        params.ccmL = AesCcmLToDthe(nonceSz);
-        params.ccmM = AesCcmMToDthe(authTagSz);
-    }
-
-    wolfSSL_TI_lockCCM();
-    ret = DTHE_AES_execute(h, &params);
-    wolfSSL_TI_unlockCCM();
-
-    if ((ret != DTHE_AES_RETURN_SUCCESS) ||
-        (ConstantCompare(authTag, tmpTag, authTagSz) != 0)) {
-        XMEMSET(out, 0, inSz);
-        return AES_GCM_AUTH_E;
-    }
-    return 0;
-}
-
-#endif /* HAVE_AESGCM || HAVE_AESCCM */
-
-/* ======================================================================== */
-/* GCM                                                                      */
-/* ======================================================================== */
-
-#ifdef HAVE_AESGCM
-
-int wc_AesGcmSetKey(Aes* aes, const byte* key, word32 len)
-{
-    return AesAuthSetKey(aes, key, len);
-}
-
-int wc_AesGcmEncrypt(Aes* aes, byte* out, const byte* in, word32 sz,
-                     const byte* iv, word32 ivSz,
-                     byte* authTag, word32 authTagSz,
-                     const byte* authIn, word32 authInSz)
-{
-    int ret = wc_local_AesGcmCheckTagSz(authTagSz);
-    if (ret != 0) return ret;
-    return AesAuthEncrypt(aes, out, in, sz, iv, ivSz, authTag, authTagSz,
-                          authIn, authInSz, DTHE_AES_GCM_MODE);
-}
-
-#if defined(HAVE_AES_DECRYPT) || defined(HAVE_AESGCM_DECRYPT)
-int wc_AesGcmDecrypt(Aes* aes, byte* out, const byte* in, word32 sz,
-                     const byte* iv, word32 ivSz,
-                     const byte* authTag, word32 authTagSz,
-                     const byte* authIn, word32 authInSz)
-{
-    return AesAuthDecrypt(aes, out, in, sz, iv, ivSz, authTag, authTagSz,
-                          authIn, authInSz, DTHE_AES_GCM_MODE);
-}
-#endif
-
-int wc_GmacSetKey(Gmac* gmac, const byte* key, word32 len)
-{
-    if (gmac == NULL) return BAD_FUNC_ARG;
-    return AesAuthSetKey(&gmac->aes, key, len);
-}
-
-int wc_GmacUpdate(Gmac* gmac, const byte* iv, word32 ivSz,
-                  const byte* authIn, word32 authInSz,
-                  byte* authTag, word32 authTagSz)
-{
-    if (gmac == NULL) return BAD_FUNC_ARG;
-    return AesAuthEncrypt(&gmac->aes, NULL, NULL, 0, iv, ivSz,
-                          authTag, authTagSz, authIn, authInSz,
-                          DTHE_AES_GCM_MODE);
-}
-
-#ifndef NO_RNG
-static WC_INLINE int CheckAesGcmIvSize(int ivSz)
-{
-    return (ivSz == GCM_NONCE_MIN_SZ ||
-            ivSz == GCM_NONCE_MID_SZ ||
-            ivSz == GCM_NONCE_MAX_SZ);
-}
-
-int wc_AesGcmSetIV(Aes* aes, word32 ivSz,
-                   const byte* ivFixed, word32 ivFixedSz,
-                   WC_RNG* rng)
-{
-    int ret = 0;
-    if (aes == NULL || rng == NULL || !CheckAesGcmIvSize((int)ivSz) ||
-        (ivFixed == NULL && ivFixedSz != 0) ||
-        (ivFixed != NULL && ivFixedSz != AES_IV_FIXED_SZ))
-        ret = BAD_FUNC_ARG;
-    if (ret == 0) {
-        byte* iv = (byte*)aes->reg;
-        if (ivFixedSz) XMEMCPY(iv, ivFixed, ivFixedSz);
-        ret = wc_RNG_GenerateBlock(rng, iv + ivFixedSz, ivSz - ivFixedSz);
-    }
-    if (ret == 0) {
-        aes->invokeCtr[0] = 0;
-        aes->invokeCtr[1] = (ivSz == GCM_NONCE_MID_SZ) ? 0 : 0xFFFFFFFF;
-    #ifdef WOLFSSL_AESGCM_STREAM
-        aes->ctrSet = 1;
-    #endif
-        aes->nonceSz = ivSz;
-    }
-    return ret;
-}
-
-int wc_AesGcmEncrypt_ex(Aes* aes, byte* out, const byte* in, word32 sz,
-                        byte* ivOut, word32 ivOutSz,
-                        byte* authTag, word32 authTagSz,
-                        const byte* authIn, word32 authInSz)
-{
-    int ret = 0;
-    if (aes == NULL || (sz != 0 && (in == NULL || out == NULL)) ||
-        ivOut == NULL || ivOutSz != aes->nonceSz ||
-        (authIn == NULL && authInSz != 0))
-        ret = BAD_FUNC_ARG;
-    if (ret == 0) {
-        aes->invokeCtr[0]++;
-        if (aes->invokeCtr[0] == 0) {
-            aes->invokeCtr[1]++;
-            if (aes->invokeCtr[1] == 0) ret = AES_GCM_OVERFLOW_E;
-        }
-    }
-    if (ret == 0) {
-        XMEMCPY(ivOut, aes->reg, ivOutSz);
-        ret = wc_AesGcmEncrypt(aes, out, in, sz, (byte*)aes->reg, ivOutSz,
-                               authTag, authTagSz, authIn, authInSz);
-        if (ret == 0) IncCtr((byte*)aes->reg, ivOutSz);
-    }
-    return ret;
-}
-
-int wc_Gmac(const byte* key, word32 keySz, byte* iv, word32 ivSz,
-            const byte* authIn, word32 authInSz,
-            byte* authTag, word32 authTagSz, WC_RNG* rng)
-{
-    WC_DECLARE_VAR(aes, Aes, 1, 0);
-    int ret;
-    if (key == NULL || iv == NULL || (authIn == NULL && authInSz != 0) ||
-        authTag == NULL || authTagSz == 0 || rng == NULL)
-        return BAD_FUNC_ARG;
-#ifdef WOLFSSL_SMALL_STACK
-    if ((aes = (Aes*)XMALLOC(sizeof *aes, NULL, DYNAMIC_TYPE_AES)) == NULL)
-        return MEMORY_E;
-#endif
-    ret = wc_AesInit(aes, NULL, INVALID_DEVID);
-    if (ret == 0)
-        ret = wc_AesGcmSetKey(aes, key, keySz);
-    if (ret == 0)
-        ret = wc_AesGcmSetIV(aes, ivSz, NULL, 0, rng);
-    if (ret == 0)
-        ret = wc_AesGcmEncrypt_ex(aes, NULL, NULL, 0, iv, ivSz,
-                                  authTag, authTagSz, authIn, authInSz);
-    wc_AesFree(aes);
-    ForceZero(aes, sizeof *aes);
-    WC_FREE_VAR_EX(aes, NULL, DYNAMIC_TYPE_AES);
-    return ret;
-}
-
-int wc_GmacVerify(const byte* key, word32 keySz,
-                  const byte* iv, word32 ivSz,
-                  const byte* authIn, word32 authInSz,
-                  const byte* authTag, word32 authTagSz)
-{
-    int ret;
-#ifdef HAVE_AES_DECRYPT
-    WC_DECLARE_VAR(aes, Aes, 1, 0);
-    if (key == NULL || iv == NULL || (authIn == NULL && authInSz != 0) ||
-        authTag == NULL || authTagSz == 0 || authTagSz > WC_AES_BLOCK_SIZE)
-        return BAD_FUNC_ARG;
-#ifdef WOLFSSL_SMALL_STACK
-    if ((aes = (Aes*)XMALLOC(sizeof *aes, NULL, DYNAMIC_TYPE_AES)) == NULL)
-        return MEMORY_E;
-#endif
-    ret = wc_AesInit(aes, NULL, INVALID_DEVID);
-    if (ret == 0) {
-        ret = wc_AesGcmSetKey(aes, key, keySz);
-        if (ret == 0)
-            ret = wc_AesGcmDecrypt(aes, NULL, NULL, 0, iv, ivSz,
-                                   authTag, authTagSz, authIn, authInSz);
-        wc_AesFree(aes);
-    }
-    ForceZero(aes, sizeof *aes);
-    WC_FREE_VAR_EX(aes, NULL, DYNAMIC_TYPE_AES);
-#else
-    (void)key; (void)keySz; (void)iv; (void)ivSz;
-    (void)authIn; (void)authInSz; (void)authTag; (void)authTagSz;
-    ret = NOT_COMPILED_IN;
-#endif
-    return ret;
-}
-#endif /* !NO_RNG */
-
-#endif /* HAVE_AESGCM */
-
-/* ======================================================================== */
-/* CCM                                                                      */
-/* ======================================================================== */
-
-#ifdef HAVE_AESCCM
-
-int wc_AesCcmSetKey(Aes* aes, const byte* key, word32 keySz)
-{
-    return AesAuthSetKey(aes, key, keySz);
-}
-
-int wc_AesCcmEncrypt(Aes* aes, byte* out, const byte* in, word32 inSz,
-                     const byte* nonce, word32 nonceSz,
-                     byte* authTag, word32 authTagSz,
-                     const byte* authIn, word32 authInSz)
-{
-    return AesAuthEncrypt(aes, out, in, inSz, nonce, nonceSz,
-                          authTag, authTagSz, authIn, authInSz,
-                          DTHE_AES_CCM_MODE);
-}
-
-int wc_AesCcmDecrypt(Aes* aes, byte* out, const byte* in, word32 inSz,
-                     const byte* nonce, word32 nonceSz,
-                     const byte* authTag, word32 authTagSz,
-                     const byte* authIn, word32 authInSz)
-{
-    return AesAuthDecrypt(aes, out, in, inSz, nonce, nonceSz,
-                          authTag, authTagSz, authIn, authInSz,
-                          DTHE_AES_CCM_MODE);
-}
-
-#ifndef WC_NO_RNG
-int wc_AesCcmSetNonce(Aes* aes, const byte* nonce, word32 nonceSz)
-{
-    int ret = 0;
-    if (aes == NULL || nonce == NULL ||
-        nonceSz < CCM_NONCE_MIN_SZ || nonceSz > CCM_NONCE_MAX_SZ)
-        ret = BAD_FUNC_ARG;
-    if (ret == 0) {
-        XMEMCPY(aes->reg, nonce, nonceSz);
-        aes->nonceSz = nonceSz;
-        aes->invokeCtr[0] = 0;
-        aes->invokeCtr[1] = 0xE0000000;
-    }
-    return ret;
-}
-
-int wc_AesCcmEncrypt_ex(Aes* aes, byte* out, const byte* in, word32 sz,
-                        byte* ivOut, word32 ivOutSz,
-                        byte* authTag, word32 authTagSz,
-                        const byte* authIn, word32 authInSz)
-{
-    int ret = 0;
-    if (aes == NULL || out == NULL || (in == NULL && sz != 0) ||
-        ivOut == NULL || (authIn == NULL && authInSz != 0) ||
-        (ivOutSz != aes->nonceSz))
-        ret = BAD_FUNC_ARG;
-    if (ret == 0) {
-        aes->invokeCtr[0]++;
-        if (aes->invokeCtr[0] == 0) {
-            aes->invokeCtr[1]++;
-            if (aes->invokeCtr[1] == 0) ret = AES_CCM_OVERFLOW_E;
-        }
-    }
-    if (ret == 0) {
-        ret = wc_AesCcmEncrypt(aes, out, in, sz, (byte*)aes->reg, aes->nonceSz,
-                               authTag, authTagSz, authIn, authInSz);
-        if (ret == 0) {
-            XMEMCPY(ivOut, aes->reg, aes->nonceSz);
-            IncCtr((byte*)aes->reg, aes->nonceSz);
-        }
-    }
-    return ret;
-}
-#endif /* !WC_NO_RNG */
-
-#endif /* HAVE_AESCCM */
-
-/* ======================================================================== */
-/* CMAC                                                                     */
-/* ======================================================================== */
-
-/* ======================================================================== */
 /* Init / Free                                                              */
 /* ======================================================================== */
 
 int wc_AesInit(Aes* aes, void* heap, int devId)
 {
+    DTHE_Handle h;
+
     if (aes == NULL) return BAD_FUNC_ARG;
+    if (!wolfSSL_TI_CCMInit())
+        return WC_HW_E;
+
     aes->heap = heap;
     (void)devId;
+
+    h = (DTHE_Handle)wolfSSL_TI_getDtheHandle();
+    if (h == NULL) return WC_HW_E;
+
+    wolfSSL_TI_lockCCM();
+    if (DTHE_AES_open(h) != DTHE_AES_RETURN_SUCCESS) {
+        wolfSSL_TI_unlockCCM();
+        return WC_HW_E;
+    }
+    wolfSSL_TI_unlockCCM();
+
     return 0;
 }
 
 void wc_AesFree(Aes* aes)
 {
+    DTHE_Handle h = (DTHE_Handle)wolfSSL_TI_getDtheHandle();
+
     (void)aes;
+    if (h != NULL) {
+        wolfSSL_TI_lockCCM();
+        DTHE_AES_close(h);
+        wolfSSL_TI_unlockCCM();
+    }
 }
 
 #endif /* !NO_AES && WOLFSSL_TI_CRYPT */
