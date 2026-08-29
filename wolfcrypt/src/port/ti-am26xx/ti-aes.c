@@ -63,9 +63,13 @@
     #include <wolfcrypt/src/misc.c>
 #endif
 
+#endif /* !NO_AES && WOLFSSL_TI_CRYPT */
+
 /* ------------------------------------------------------------------------ */
-/* DTHE init, handle, and mutex (shared with ti-hash.c via ti-ccm.h)        */
+/* DTHE init, handle, and mutex (shared with ti-hash.c/ti-hmac.c via         */
+/* ti-ccm.h) -- available whenever hardware AES or hardware hash is enabled */
 /* ------------------------------------------------------------------------ */
+#if defined(WOLFSSL_TI_CRYPT) || defined(WOLFSSL_TI_HASH)
 
 static DTHE_Handle gDtheHandle = NULL;
 static bool        gDtheInit   = false;
@@ -154,6 +158,10 @@ void wolfSSL_TI_unlockCCM(void)
 #endif
 
 #endif /* TI_DUMMY_BUILD */
+
+#endif /* WOLFSSL_TI_CRYPT || WOLFSSL_TI_HASH */
+
+#if !defined(NO_AES) && defined(WOLFSSL_TI_CRYPT)
 
 /* ------------------------------------------------------------------------ */
 /* Helpers                                                                  */

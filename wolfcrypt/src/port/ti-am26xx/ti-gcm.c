@@ -214,6 +214,13 @@ static int AesGcmDeriveJ0(Aes* aes, const byte* nonce, word32 nonceSz,
     DTHE_AES_close(h);
     wolfSSL_TI_unlockCCM();
 
+    wolfSSL_TI_lockCCM();
+    if (DTHE_AES_open(h) != DTHE_AES_RETURN_SUCCESS) {
+        wolfSSL_TI_unlockCCM();
+        return WC_HW_E;
+    }
+    wolfSSL_TI_unlockCCM();
+
     return (ret == DTHE_AES_RETURN_SUCCESS) ? 0 : WC_HW_E;
 }
 
@@ -227,6 +234,8 @@ static int AesAuthEncrypt(Aes* aes, byte* out, const byte* in, word32 inSz,
     DTHE_Handle h = (DTHE_Handle)wolfSSL_TI_getDtheHandle();
     word32 tmpTag[WC_AES_BLOCK_SIZE / sizeof(word32)];
     word32 ivBlock[WC_AES_BLOCK_SIZE / sizeof(word32)];
+    byte hSubkey[WC_AES_BLOCK_SIZE];
+    uint32_t modeSelect = DTHE_AES_NO_MODE;
     uint32_t algoType = (mode == DTHE_AES_CCM_MODE) ? DTHE_AES_CCM_MODE
                                                      : DTHE_AES_GCM_MODE;
 
@@ -236,14 +245,43 @@ static int AesAuthEncrypt(Aes* aes, byte* out, const byte* in, word32 inSz,
     if (ret != 0) return ret;
     if ((authIn == NULL) && (authInSz > 0)) return BAD_FUNC_ARG;
 
-    if (inSz == 0 && authInSz == 0) {
+    /* DTHE_AES_setIV() always writes all 4 IV registers (16 bytes), but
+     * nonce is only nonceSz bytes, so it must be expanded into a full
+     * 16-byte J0 block rather than passed as-is (which reads past the end
+     * of the caller's nonce buffer). For the standard 96-bit GCM nonce,
+     * J0 = nonce || 0x00000001, matching NIST SP 800-38D and TI's own
+     * DTHE GCM examples (mode 3 expects a pre-built J0, it does not
+     * derive it from a raw IV in hardware). Any other IV length needs
+     * the hardware-GHASH-based J0 derivation in AesGcmDeriveJ0(). Computed
+     * up front since the empty-input fast path below also needs J0. */
+    if ((algoType == DTHE_AES_GCM_MODE) && (nonceSz != GCM_NONCE_MID_SZ)) {
+        ret = AesGcmDeriveJ0(aes, nonce, nonceSz, hSubkey, (byte*)ivBlock);
+        if (ret != 0) return ret;
+        modeSelect = DTHE_AES_GCM_MODE_2;
+    }
+    else {
+        XMEMSET(ivBlock, 0, sizeof(ivBlock));
+        XMEMCPY(ivBlock, nonce, nonceSz);
+        if (algoType == DTHE_AES_GCM_MODE)
+            ((byte*)ivBlock)[WC_AES_BLOCK_SIZE - 1] = 0x01;
+    }
+
+    /* GCM defines Tag = MSB(GHASH_H(A || C || len(A) || len(C)) XOR
+     * CIPH_K(J0)); when both A and C are empty, GHASH's input collapses to
+     * a single all-zero block, so GHASH_H(0^128) = 0 and the tag reduces
+     * to CIPH_K(J0) directly (NIST SP 800-38D Sec. 7.1). The DTHE hardware
+     * GCM/GHASH modes refuse dataLenBytes == 0 together with aadLength ==
+     * 0 (DTHE_AES_validateExecuteParams() in the TI SDK), so this case is
+     * computed with a plain ECB encrypt of the already-derived J0 instead
+     * of going through the hardware GCM path. */
+    if ((algoType == DTHE_AES_GCM_MODE) && inSz == 0 && authInSz == 0) {
         DTHE_AES_Params ecb;
         XMEMSET(&ecb, 0, sizeof(ecb));
         ecb.algoType = DTHE_AES_ECB_MODE;
         ecb.opType   = DTHE_AES_ENCRYPT;
         ecb.ptrKey   = (uint32_t*)aes->key;
         ecb.keyLen   = AesKeyLenToDthe(aes->keylen);
-        ecb.ptrPlainTextData = (uint32_t*)(uintptr_t)SOC_virtToPhy((void*)aes->reg);
+        ecb.ptrPlainTextData = (uint32_t*)(uintptr_t)SOC_virtToPhy((void*)ivBlock);
         ecb.ptrEncryptedData = (uint32_t*)(uintptr_t)SOC_virtToPhy((void*)tmpTag);
         ecb.dataLenBytes = WC_AES_BLOCK_SIZE;
         ecb.streamState  = DTHE_AES_ONE_SHOT_SUPPORT;
@@ -255,30 +293,7 @@ static int AesAuthEncrypt(Aes* aes, byte* out, const byte* in, word32 inSz,
         return 0;
     }
 
-    /* DTHE_AES_setIV() always writes all 4 IV registers (16 bytes), but
-     * nonce is only nonceSz bytes, so it must be expanded into a full
-     * 16-byte J0 block rather than passed as-is (which reads past the end
-     * of the caller's nonce buffer). For the standard 96-bit GCM nonce,
-     * J0 = nonce || 0x00000001, matching NIST SP 800-38D and TI's own
-     * DTHE GCM examples (mode 3 expects a pre-built J0, it does not
-     * derive it from a raw IV in hardware). Any other IV length needs
-     * the hardware-GHASH-based J0 derivation in AesGcmDeriveJ0(). */
     {
-        byte hSubkey[WC_AES_BLOCK_SIZE];
-        uint32_t modeSelect = DTHE_AES_NO_MODE;
-
-        if ((algoType == DTHE_AES_GCM_MODE) && (nonceSz != GCM_NONCE_MID_SZ)) {
-            ret = AesGcmDeriveJ0(aes, nonce, nonceSz, hSubkey, (byte*)ivBlock);
-            if (ret != 0) return ret;
-            modeSelect = DTHE_AES_GCM_MODE_2;
-        }
-        else {
-            XMEMSET(ivBlock, 0, sizeof(ivBlock));
-            XMEMCPY(ivBlock, nonce, nonceSz);
-            if (algoType == DTHE_AES_GCM_MODE)
-                ((byte*)ivBlock)[WC_AES_BLOCK_SIZE - 1] = 0x01;
-        }
-
         XMEMSET(&params, 0, sizeof(params));
         params.algoType     = algoType;
         params.opType       = DTHE_AES_ENCRYPT;
@@ -325,6 +340,8 @@ static int AesAuthDecrypt(Aes* aes, byte* out, const byte* in, word32 inSz,
     DTHE_Handle h = (DTHE_Handle)wolfSSL_TI_getDtheHandle();
     word32 tmpTag[WC_AES_BLOCK_SIZE / sizeof(word32)];
     word32 ivBlock[WC_AES_BLOCK_SIZE / sizeof(word32)];
+    byte hSubkey[WC_AES_BLOCK_SIZE];
+    uint32_t modeSelect = DTHE_AES_NO_MODE;
     uint32_t algoType = (mode == DTHE_AES_CCM_MODE) ? DTHE_AES_CCM_MODE
                                                      : DTHE_AES_GCM_MODE;
 
@@ -334,14 +351,35 @@ static int AesAuthDecrypt(Aes* aes, byte* out, const byte* in, word32 inSz,
     if (ret != 0) return ret;
     if ((authIn == NULL) && (authInSz > 0)) return BAD_FUNC_ARG;
 
-    if (inSz == 0 && authInSz == 0) {
+    /* See AesAuthEncrypt() above: nonce must be expanded into a full
+     * 16-byte J0 block before being handed to the DTHE IV registers,
+     * deriving it via hardware GHASH for any length other than the
+     * standard 12-byte case. Computed up front since the empty-input
+     * fast path below also needs J0. */
+    if ((algoType == DTHE_AES_GCM_MODE) && (nonceSz != GCM_NONCE_MID_SZ)) {
+        ret = AesGcmDeriveJ0(aes, nonce, nonceSz, hSubkey, (byte*)ivBlock);
+        if (ret != 0) return ret;
+        modeSelect = DTHE_AES_GCM_MODE_2;
+    }
+    else {
+        XMEMSET(ivBlock, 0, sizeof(ivBlock));
+        XMEMCPY(ivBlock, nonce, nonceSz);
+        if (algoType == DTHE_AES_GCM_MODE)
+            ((byte*)ivBlock)[WC_AES_BLOCK_SIZE - 1] = 0x01;
+    }
+
+    /* See AesAuthEncrypt() above: with both A and C empty, Tag reduces to
+     * CIPH_K(J0) directly, and the DTHE hardware GCM/GHASH modes refuse
+     * dataLenBytes == 0 with aadLength == 0, so verify by recomputing
+     * CIPH_K(J0) via plain ECB instead of the hardware GCM path. */
+    if ((algoType == DTHE_AES_GCM_MODE) && inSz == 0 && authInSz == 0) {
         DTHE_AES_Params ecb;
         XMEMSET(&ecb, 0, sizeof(ecb));
         ecb.algoType = DTHE_AES_ECB_MODE;
         ecb.opType   = DTHE_AES_ENCRYPT;
         ecb.ptrKey   = (uint32_t*)aes->key;
         ecb.keyLen   = AesKeyLenToDthe(aes->keylen);
-        ecb.ptrPlainTextData = (uint32_t*)(uintptr_t)SOC_virtToPhy((void*)aes->reg);
+        ecb.ptrPlainTextData = (uint32_t*)(uintptr_t)SOC_virtToPhy((void*)ivBlock);
         ecb.ptrEncryptedData = (uint32_t*)(uintptr_t)SOC_virtToPhy((void*)tmpTag);
         ecb.dataLenBytes = WC_AES_BLOCK_SIZE;
         ecb.streamState  = DTHE_AES_ONE_SHOT_SUPPORT;
@@ -353,26 +391,7 @@ static int AesAuthDecrypt(Aes* aes, byte* out, const byte* in, word32 inSz,
                                                                   : AES_GCM_AUTH_E;
     }
 
-    /* See AesAuthEncrypt() above: nonce must be expanded into a full
-     * 16-byte J0 block before being handed to the DTHE IV registers,
-     * deriving it via hardware GHASH for any length other than the
-     * standard 12-byte case. */
     {
-        byte hSubkey[WC_AES_BLOCK_SIZE];
-        uint32_t modeSelect = DTHE_AES_NO_MODE;
-
-        if ((algoType == DTHE_AES_GCM_MODE) && (nonceSz != GCM_NONCE_MID_SZ)) {
-            ret = AesGcmDeriveJ0(aes, nonce, nonceSz, hSubkey, (byte*)ivBlock);
-            if (ret != 0) return ret;
-            modeSelect = DTHE_AES_GCM_MODE_2;
-        }
-        else {
-            XMEMSET(ivBlock, 0, sizeof(ivBlock));
-            XMEMCPY(ivBlock, nonce, nonceSz);
-            if (algoType == DTHE_AES_GCM_MODE)
-                ((byte*)ivBlock)[WC_AES_BLOCK_SIZE - 1] = 0x01;
-        }
-
         XMEMSET(&params, 0, sizeof(params));
         params.algoType     = algoType;
         params.opType       = DTHE_AES_DECRYPT;

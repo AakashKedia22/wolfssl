@@ -33,6 +33,7 @@
     extern "C" {
 #endif
 
+#include <limits.h>
 #include <stdint.h>
 
 #include <wolfssl/wolfcrypt/error-crypt.h>
